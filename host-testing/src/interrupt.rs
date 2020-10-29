@@ -3,7 +3,8 @@ use std::collections::BinaryHeap;
 use std::mem::{size_of, transmute};
 use std::os::unix::net::UnixDatagram;
 use std::path::Path;
-use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
+use std::sync::mpsc::{channel, Receiver, Sender,  RecvTimeoutError};
+use std::time::Duration;
 
 use crate::Result;
 
@@ -19,7 +20,7 @@ pub struct UpperHalf {
 }
 
 pub struct LowerHalf {
-    reciever: Receiver<Interrupt>,
+    receiver: Receiver<Interrupt>,
     pending: BinaryHeap<Interrupt>,
 }
 
@@ -45,8 +46,8 @@ impl Ord for Interrupt {
 /// external interrupts.
 pub fn new_interrupt_channel(external_source: &Path) -> Result<(UpperHalf, LowerHalf)> {
     let socket = UnixDatagram::bind(external_source)?;
-    let (sender, reciever): (Sender<Interrupt>, Receiver<Interrupt>) = channel();
-    Ok((UpperHalf::new(sender, socket), LowerHalf::new(reciever)))
+    let (sender, receiver): (Sender<Interrupt>, Receiver<Interrupt>) = channel();
+    Ok((UpperHalf::new(sender, socket), LowerHalf::new(receiver)))
 }
 
 impl UpperHalf {
@@ -71,42 +72,49 @@ impl UpperHalf {
 }
 
 impl LowerHalf {
-    fn new(reciever: Receiver<Interrupt>) -> LowerHalf {
+    fn new(receiver: Receiver<Interrupt>) -> LowerHalf {
         LowerHalf {
-            reciever: reciever,
+            receiver: receiver,
             pending: BinaryHeap::new(),
         }
     }
 
-    fn recieve_interrupts(&mut self, block: bool) {
-        let interrupt = if block {
-            match self.reciever.recv() {
-                Ok(inter) => Ok(inter),
-                Err(e) => Err(TryRecvError::from(e)),
+    fn receive_interrupts(&mut self, wait_us : Option<u128>) {
+        if wait_us.is_none() {
+            match self.receiver.try_recv() {
+                Ok(interrupt) => self.pending.push(interrupt),
+                Err(e) => {
+                    kernel::debug!("Failed to receive interrupt: {}", e);
+                },
             }
         } else {
-            self.reciever.try_recv()
-        };
-
-        match interrupt {
-            Ok(interrupt) => self.pending.push(interrupt),
-            Err(e) => {
-                kernel::debug!("Failed to receive interrupt: {}", e);
+            let wait_us = Duration::from_millis(wait_us.unwrap() as u64);
+            match self.receiver.recv_timeout(wait_us) {
+                Ok(interrupt) => self.pending.push(interrupt),
+                Err(RecvTimeoutError::Timeout) => { },
+                Err(e) => {
+                    kernel::debug!("Failed to receive interrupt: {}", e);
+                },
             }
-        };
+        }
     }
 
-    pub fn wait_for_interrupt(&mut self) -> Interrupt {
+    pub fn wait_for_interrupt(&mut self, wait_us : Option<u128>) -> Option<Interrupt> {
         kernel::debug!("Sleeping...");
-        self.recieve_interrupts(true);
+        self.receive_interrupts(wait_us);
         match self.pending.pop() {
-            Some(interrupt) => interrupt,
-            None => panic!("Recieved empty interrupt."),
+            Some(interrupt) => Some(interrupt),
+            None => {
+                if wait_us.is_some() {
+                    panic!("Received empty interrupt.");
+                }
+                    None
+            },
         }
     }
 
     pub fn has_pending_interrupts(&mut self) -> bool {
-        self.recieve_interrupts(false);
+        self.receive_interrupts(None);
         self.pending.peek().is_some()
     }
 }
@@ -115,7 +123,7 @@ impl Iterator for &mut LowerHalf {
     type Item = Interrupt;
 
     fn next(&mut self) -> Option<Interrupt> {
-        self.recieve_interrupts(false);
+        self.receive_interrupts(None);
         self.pending.pop()
     }
 }
